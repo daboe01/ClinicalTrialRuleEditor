@@ -47,6 +47,7 @@
 }
 @end
 
+
 // --------------------------------------------------------------------------------
 // FHIRRuleEditor Subclass
 // --------------------------------------------------------------------------------
@@ -66,15 +67,15 @@
     return _insertCompoundMode;
 }
 
-// Intercepts the inline "+" button clicks on the slices
+// Intercepts the inline "+" button clicks on the slices to force compound row generation if toggled
 - (void)_addOptionFromSlice:(id)slice ofRowType:(unsigned int)type
 {
-    // If the mode toggle is set to Group, force CPRuleEditorRowTypeCompound
     var forcedType = _insertCompoundMode ? CPRuleEditorRowTypeCompound : CPRuleEditorRowTypeSimple;
     [super _addOptionFromSlice:slice ofRowType:forcedType];
 }
 
 @end
+
 
 // --------------------------------------------------------------------------------
 // FHIRCriteriaWindowController
@@ -82,21 +83,23 @@
 
 @implementation FHIRCriteriaWindowController : CPWindowController
 {
-    FHIRRuleEditor      _ruleEditor;
-    FHIRRuleDelegate    _ruleDelegate;
-    CPTextView          _jsonTextView;
+    FHIRRuleEditor       _ruleEditor;
+    FHIRRuleDelegate     _ruleDelegate;
+    CPTextView           _jsonTextView;
+    CPSegmentedControl   _modeSegmentedControl;
     
     CPButton            _addRuleBtn;
     CPButton            _addGroupBtn;
     CPButton            _clearBtn;
+
+    CPArray             _currentTextFields;
+    int                 _currentTextFieldIndex;
 }
 
 - (id)initWithContentRect:(CGRect)aRect
 {
-    var theWindow = [[CPWindow alloc] initWithContentRect:aRect styleMask:CPBorderlessBridgeWindowMask];
-
-    [theWindow setMinSize:CGSizeMake(800, 550)];
-    [theWindow setTitle:@"FHIR R6 Study Eligibility Criteria Builder"];
+    // CPBorderlessBridgeWindowMask makes this a bridged window matching the browser viewport
+    var theWindow = [[CPWindow alloc] initWithContentRect:CGRectMakeZero() styleMask:CPBorderlessBridgeWindowMask];
 
     self = [super initWithWindow:theWindow];
     if (self)
@@ -140,16 +143,16 @@
     [ruleScrollView setAutohidesScrollers:YES];
     [ruleScrollView setBorderType:CPBezelBorder];
 
-    // Instantiate custom FHIRRuleEditor
     _ruleEditor = [[FHIRRuleEditor alloc] initWithFrame:CGRectMake(0, 0, CGRectGetWidth([ruleScrollView bounds]), ruleEditorHeight)];
     [_ruleEditor setRowHeight:28.0];
     [_ruleEditor setCanRemoveAllRows:YES];
-    [_ruleEditor setNestingMode:CPRuleEditorNestingModeCompound];
+    [_ruleEditor setNestingMode:CPRuleEditorNestingModeCompound]; // Enables nesting (AND / OR blocks)
     [_ruleEditor setAutoresizingMask:CPViewWidthSizable];
 
     _ruleDelegate = [[FHIRRuleDelegate alloc] initWithController:self];
     [_ruleEditor setDelegate:_ruleDelegate];
 
+    // Connect update target and action
     [_ruleEditor setTarget:self];
     [_ruleEditor setAction:@selector(ruleEditorDidChange:)];
 
@@ -201,16 +204,25 @@
     [jsonScrollView setDocumentView:_jsonTextView];
     [rightContainer addSubview:jsonScrollView];
 
+    // Add views to split view
     [mainSplitView addSubview:leftContainer];
     [mainSplitView addSubview:rightContainer];
     [contentView addSubview:mainSplitView];
 
+    // Set initial configuration
     [self resetEditor:self];
     
+    // Register observation for automatic synchronization
     [[CPNotificationCenter defaultCenter] addObserver:self 
                                              selector:@selector(ruleEditorDidChange:) 
                                                  name:CPRuleEditorRowsDidChangeNotification 
                                                object:_ruleEditor];
+}
+
+- (void)modeSegmentedControlDidChange:(id)sender
+{
+    var selectedSegment = [sender selectedSegment];
+    [_ruleEditor setInsertCompoundMode:(selectedSegment === 1)];
 }
 
 - (void)addSimpleRule:(id)sender
@@ -240,7 +252,6 @@
     var count = [_ruleEditor numberOfRows];
     if (count > 0)
     {
-        // Safe standard removal of rows without touching internal subviews
         var indexes = [CPIndexSet indexSetWithIndexesInRange:NSMakeRange(0, count)];
         [_ruleEditor removeRowsAtIndexes:indexes includeSubrows:YES];
     }
@@ -255,54 +266,103 @@
 }
 
 // --------------------------------------------------------------------------------
+// View Hierarchy Scanning Helpers
+// --------------------------------------------------------------------------------
+
+- (CPArray)_allEditableTextFields
+{
+    var textFields = [CPMutableArray array];
+    [self _collectEditableTextFieldsFromView:_ruleEditor intoArray:textFields];
+    
+    // Sort array using Cappuccino's native sortUsingFunction:context: method
+    [textFields sortUsingFunction:function(tf1, tf2, context) {
+        var origin1 = [tf1 convertPoint:CGPointMakeZero() toView:nil];
+        var origin2 = [tf2 convertPoint:CGPointMakeZero() toView:nil];
+        
+        if (origin1.y < origin2.y) return -1;
+        if (origin1.y > origin2.y) return 1;
+        if (origin1.x < origin2.x) return -1;
+        if (origin1.x > origin2.x) return 1;
+        return 0;
+    } context:nil];
+    
+    return textFields;
+}
+
+- (void)_collectEditableTextFieldsFromView:(CPView)aView intoArray:(CPMutableArray)array
+{
+    if ([aView isKindOfClass:[CPTextField class]] && [aView isEditable])
+    {
+        [array addObject:aView];
+        return;
+    }
+    
+    var subviews = [aView subviews];
+    for (var i = 0; i < [subviews count]; i++)
+    {
+        [self _collectEditableTextFieldsFromView:subviews[i] intoArray:array];
+    }
+}
+
+// --------------------------------------------------------------------------------
 // FHIR Compiler Logic
 // --------------------------------------------------------------------------------
 
 - (void)updateFHIRGroupRepresentation
 {
-    var containedArray = [CPMutableArray array];
-    var subgroupCounter = { value: 0 };
-    
-    // Check if the very first row is the root compound group
-    var hasRootCompound = ([_ruleEditor numberOfRows] > 0 && [_ruleEditor rowTypeForRow:0] == CPRuleEditorRowTypeCompound);
-    var rootGroupIndex = hasRootCompound ? 0 : -1;
+    // Retrieve currently mounted text field instances inside the editor
+    _currentTextFields = [self _allEditableTextFields];
+    _currentTextFieldIndex = 0;
 
-    var rootGroup = [self _compileGroupForRowIndex:rootGroupIndex containedArray:containedArray subgroupCounter:subgroupCounter];
+    var containedArray = [CPMutableArray array];
+    var subgroupCounter = { value: 0 }; 
     
-    // Ensure root ID and definitional metadata are preserved
+    var rootGroup;
+    var hasRootCompound = ([_ruleEditor numberOfRows] > 0 && [_ruleEditor rowTypeForRow:0] == CPRuleEditorRowTypeCompound);
+    
+    if (hasRootCompound)
+    {
+        rootGroup = [self _compileGroupForRowIndex:0 containedArray:containedArray subgroupCounter:subgroupCounter];
+    }
+    else
+    {
+        rootGroup = [self _compileGroupForRowIndex:-1 containedArray:containedArray subgroupCounter:subgroupCounter];
+    }
+    
+    [rootGroup setObject:@"Group" forKey:@"resourceType"];
     [rootGroup setObject:@"eligibility-criteria" forKey:@"id"];
     [rootGroup setObject:@"active" forKey:@"status"];
     [rootGroup setObject:@"definitional" forKey:@"membership"];
     [rootGroup setObject:@"person" forKey:@"type"];
-
+    
+    var rootCombMethod = "all-of";
+    if (hasRootCompound)
+    {
+        var criteria = [_ruleEditor criteriaForRow:0];
+        if ([criteria count] > 0)
+        {
+            var methodVal = [criteria objectAtIndex:0];
+            if (methodVal === CPOrPredicateType)
+                rootCombMethod = "any-of";
+        }
+    }
+    [rootGroup setObject:rootCombMethod forKey:@"combinationMethod"];
+    
     if ([containedArray count] > 0)
     {
         [rootGroup setObject:containedArray forKey:@"contained"];
     }
     
     var jsFormattedObject = [rootGroup JSObject];
-    [_jsonTextView setString:JSON.stringify(jsFormattedObject, null, 2)];
-}
-
-- (void)modeSegmentedControlDidChange:(id)sender
-{
-    var selectedSegment = [sender selectedSegment];
-    [_ruleEditor setInsertCompoundMode:(selectedSegment === 1)];
+    var prettyJson = JSON.stringify(jsFormattedObject, null, 2);
+    
+    [_jsonTextView setString:prettyJson];
 }
 
 - (CPMutableDictionary)_compileGroupForRowIndex:(CPInteger)rowIndex containedArray:(CPMutableArray)containedArray subgroupCounter:(id)subgroupCounter
 {
     var group = [CPMutableDictionary dictionary];
     [group setObject:@"Group" forKey:@"resourceType"];
-    
-    if (rowIndex == -1)
-    {
-        [group setObject:@"eligibility-criteria" forKey:@"id"];
-        [group setObject:@"active" forKey:@"status"];
-        [group setObject:@"definitional" forKey:@"membership"];
-        [group setObject:@"person" forKey:@"type"];
-        [group setObject:@"all-of" forKey:@"combinationMethod"]; // Standard root logical combination
-    }
     
     var subrowIndexes = [_ruleEditor subrowIndexesForRow:rowIndex];
     var characteristics = [CPMutableArray array];
@@ -314,7 +374,6 @@
         
         if (rowType == CPRuleEditorRowTypeCompound)
         {
-            // Set up a structured nested group within 'contained'
             subgroupCounter.value = subgroupCounter.value + 1;
             var subgroupID = "subgroup-" + subgroupCounter.value;
             
@@ -323,7 +382,6 @@
             [subGroup setObject:@"conceptual" forKey:@"membership"];
             [subGroup setObject:@"person" forKey:@"type"];
             
-            // Determine combination method ("all-of" or "any-of")
             var criteria = [_ruleEditor criteriaForRow:current_index];
             var combMethod = "all-of";
             if ([criteria count] > 0)
@@ -336,35 +394,38 @@
             
             [containedArray addObject:subGroup];
             
-            // Reference this subgroup in the outer characteristic array
             var refCharacteristic = [CPMutableDictionary dictionary];
             [refCharacteristic setObject:@{ @"text": @"Logical subgroup" } forKey:@"code"];
             [refCharacteristic setObject:@{ @"reference": "#" + subgroupID } forKey:@"valueReference"];
-            [refCharacteristic setObject:[CPNumber numberWithBool:NO] forKey:@"exclude"];
+            [refCharacteristic setObject:NO forKey:@"exclude"];
             
             [characteristics addObject:refCharacteristic];
         }
         else // Simple Criterion
         {
             var criteria = [_ruleEditor criteriaForRow:current_index];
-            var displayValues = [_ruleEditor displayValuesForRow:current_index];
             
             if ([criteria count] >= 3)
             {
                 var presence = [criteria objectAtIndex:1]; // "inclusion" or "exclusion"
-                var textField = [displayValues objectAtIndex:2]; // custom CPTextField
-                var rawText = [textField stringValue] || @"";
+                
+                // Align chronological compilation with vertically sorted view elements
+                var rawText = @"";
+                if (_currentTextFieldIndex < [_currentTextFields count])
+                {
+                    var textField = [_currentTextFields objectAtIndex:_currentTextFieldIndex];
+                    rawText = [textField stringValue] || @"";
+                    _currentTextFieldIndex++;
+                }
                 
                 var clinicalTerm = [rawText stringByTrimmingCharactersInSet:[CPCharacterSet whitespaceAndNewlineCharacterSet]];
                 var hpoTermName = [clinicalTerm isEqualToString:@""] ? @"UNDEFINED" : clinicalTerm;
                 
-                // Construct required placeholder format
                 var formattedTerm = hpoTermName.toUpperCase().replace(/\s+/g, '_');
                 var hpoCodePlaceholder = "[HPO_CODE_FOR_" + formattedTerm + "]";
                 
                 var charItem = [CPMutableDictionary dictionary];
                 
-                // SNOMED representation
                 [charItem setObject:@{
                     @"coding": [
                         @{
@@ -375,7 +436,6 @@
                     ]
                 } forKey:@"code"];
                 
-                // HPO Mapping Structure
                 [charItem setObject:@{
                     @"coding": [
                         @{
@@ -387,7 +447,7 @@
                 } forKey:@"valueCodeableConcept"];
                 
                 var isExclude = [presence isEqualToString:@"exclusion"];
-                [charItem setObject:[CPNumber numberWithBool:isExclude] forKey:@"exclude"];
+                [charItem setObject:isExclude forKey:@"exclude"]; // native JS boolean output
                 
                 [characteristics addObject:charItem];
             }
@@ -480,9 +540,14 @@
         [inputField setBackgroundColor:[CPColor whiteColor]];
         [inputField setPlaceholderString:@"e.g., Corneal erosion"];
         
-        // Auto-compile as soon as text is submitted or changed
         [inputField setTarget:_controller];
         [inputField setAction:@selector(ruleEditorDidChange:)];
+        
+        // Listen to every continuous text change keystroke to keep the live JSON updated
+        [[CPNotificationCenter defaultCenter] addObserver:_controller 
+                                                 selector:@selector(ruleEditorDidChange:) 
+                                                     name:CPControlTextDidChangeNotification 
+                                                   object:inputField];
         
         return inputField;
     }
@@ -492,7 +557,6 @@
 
 - (CPDictionary)ruleEditor:(CPRuleEditor)editor predicatePartsForCriterion:(id)criterion withDisplayValue:(id)value inRow:(int)row
 {
-    // Minimal standard mapping (this keeps the internal rule compiler satisfied)
     var result = [CPMutableDictionary dictionary];
     
     if (criterion === CPOrPredicateType || criterion === CPAndPredicateType)
